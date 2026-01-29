@@ -1,0 +1,6 @@
+python>=3.10
+torch>=2.0
+datasets>=2.16
+sentencepiece>=0.1.99
+numpy
+tqdm
