@@ -13,3 +13,7 @@ class Constants:
     # Normalization behavior
     LOWERCASE = True
     STRIP = True
+
+    # Tensor dtypes
+    IDS_DTYPE = "long"      # torch.long
+    MASK_DTYPE = "bool"     # torch.bool
