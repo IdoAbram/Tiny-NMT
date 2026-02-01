@@ -3,6 +3,8 @@ from data.constants import Constants
 from data.special_tokens import SpecialTokens
 from data.tokenizer import Tokenizer
 
+MAX_VOCAB_SIZE = 20000 
+
 
 class Vocabulary:
     def __init__(self, tokenizer: Tokenizer, specials: SpecialTokens):
@@ -15,9 +17,21 @@ class Vocabulary:
 
     def build(self, texts: list[str]) -> None:
         counts = self._count_tokens(texts)
-        for token, freq in counts.items():
-            if freq >= Constants.MIN_FREQ:
-                self._add(token)
+
+        # ממיינים לפי שכיחות (גבוה → נמוך)
+        sorted_tokens = sorted(
+            counts.items(), key=lambda x: x[1], reverse=True
+        )
+
+        for token, freq in sorted_tokens:
+            if freq < Constants.MIN_FREQ:
+                continue
+
+            if len(self._token2id) >= MAX_VOCAB_SIZE:
+                break
+
+            self._add(token)
+
         self._is_built = True
 
     def encode(self, text: str) -> list[int]:
