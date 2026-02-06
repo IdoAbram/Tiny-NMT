@@ -1,13 +1,13 @@
 # inference/beam_decoder.py
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List
 
 import torch
 
 from model.seq2seq_model import Seq2SeqModel
+from model.encoder_output import EncoderOutput
 from model.decoder_state import DecoderState
 
 
@@ -21,11 +21,8 @@ class _Hyp:
 
 class BeamSearchDecoder:
     """
-    Beam Search decoding for your Seq2SeqModel (LSTM + Bahdanau attention).
-
-    Notes:
-    - Runs beam search per-sample (loops over batch dimension). Simple & robust.
-    - Uses length penalty (optional) to avoid preferring too-short sequences.
+    Beam search per-sample (robust & simple).
+    Uses length penalty to reduce preference for too-short outputs.
     """
 
     def __init__(
@@ -37,7 +34,6 @@ class BeamSearchDecoder:
         beam_size: int = 5,
         len_penalty_alpha: float = 0.6,
     ):
-        assert beam_size >= 1
         self._model = model
         self._bos = int(bos_id)
         self._eos = int(eos_id)
@@ -45,15 +41,10 @@ class BeamSearchDecoder:
         self._beam = int(beam_size)
         self._alpha = float(len_penalty_alpha)
 
+        assert self._beam >= 1
+
     @torch.no_grad()
     def translate(self, src_ids: torch.Tensor, src_mask: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            src_ids:  [B, S]
-            src_mask: [B, S] (bool/int)
-        Returns:
-            out_ids:  [B, T] where T <= max_len+1 (includes BOS and generated tokens)
-        """
         self._model.eval()
         enc_out = self._model._enc(src_ids, src_mask)
 
@@ -62,13 +53,11 @@ class BeamSearchDecoder:
         outputs: List[torch.Tensor] = []
 
         for i in range(B):
-            # slice single example
-            states_i = enc_out.states[i : i + 1]  # [1, S, enc_dim]
-            mask_i = enc_out.mask[i : i + 1]      # [1, S]
-            best_ids = self._decode_one(states_i, mask_i, device)
-            outputs.append(best_ids)
+            enc_i = self._slice_enc_out(enc_out, i)
+            best = self._decode_one(enc_i, device)
+            outputs.append(best)
 
-        # pad to same length across batch
+        # pad outputs to same length
         maxT = max(t.size(0) for t in outputs)
         padded = []
         for t in outputs:
@@ -77,31 +66,32 @@ class BeamSearchDecoder:
                 padded.append(torch.cat([t, pad], dim=0))
             else:
                 padded.append(t)
-        return torch.stack(padded, dim=0)  # [B, maxT]
+
+        return torch.stack(padded, dim=0)
+
+    def _slice_enc_out(self, enc_out: EncoderOutput, i: int) -> EncoderOutput:
+        # states: [B,S,E], mask: [B,S], final_hidden/cell: [L*D,B,H]
+        return EncoderOutput(
+            states=enc_out.states[i : i + 1],
+            final_hidden=enc_out.final_hidden[:, i : i + 1, :],
+            final_cell=enc_out.final_cell[:, i : i + 1, :],
+            mask=enc_out.mask[i : i + 1] if enc_out.mask is not None else None,
+        )
 
     def _len_penalty(self, length: int) -> float:
-        # Common MT length penalty: lp = ((5+len)/6)^alpha
-        if self._alpha <= 0:
+        if self._alpha <= 0.0:
             return 1.0
+        # Common: ((5+len)/6)^alpha
         return ((5.0 + float(length)) / 6.0) ** self._alpha
 
-    def _decode_one(self, enc_states: torch.Tensor, src_mask: torch.Tensor, device: torch.device) -> torch.Tensor:
-        """
-        Beam search for a single sample.
-        enc_states: [1, S, enc_dim]
-        src_mask:   [1, S]
-        returns: 1D tensor of token ids (includes BOS, ends with EOS usually)
-        """
-        # init decoder state for a single sample
-        state0 = self._model._dec.init_state(1, device)
+    def _decode_one(self, enc_out: EncoderOutput, device: torch.device) -> torch.Tensor:
+        # NEW: init decoder from encoder final state (instead of zeros)
+        state0 = self._model.init_decoder_state(enc_out)
 
-        # start with BOS
-        init = _Hyp(ids=[self._bos], score=0.0, state=state0, ended=False)
-        beam: List[_Hyp] = [init]
+        beam: List[_Hyp] = [_Hyp(ids=[self._bos], score=0.0, state=state0, ended=False)]
         finished: List[_Hyp] = []
 
-        for _t in range(self._max_len):
-            # if we already have enough finished hyps, we can stop early
+        for _ in range(self._max_len):
             if len(finished) >= self._beam:
                 break
 
@@ -109,18 +99,15 @@ class BeamSearchDecoder:
 
             for hyp in beam:
                 if hyp.ended:
-                    # keep ended hypotheses as-is
                     candidates.append(hyp)
                     continue
 
                 prev_id = torch.tensor([hyp.ids[-1]], dtype=torch.long, device=device)  # [1]
-                step = self._model._dec.step(prev_id, hyp.state, enc_states, src_mask)
+                step = self._model._dec.step(prev_id, hyp.state, enc_out.states, enc_out.mask)
+
                 logits = step.logits.squeeze(0)  # [V]
+                log_probs = torch.log_softmax(logits, dim=-1)
 
-                # log-probs
-                log_probs = torch.log_softmax(logits, dim=-1)  # [V]
-
-                # take top K next tokens for this hypothesis
                 topk_logp, topk_ids = torch.topk(log_probs, k=self._beam)
 
                 for k in range(self._beam):
@@ -131,8 +118,7 @@ class BeamSearchDecoder:
                     new_score = hyp.score + tok_lp
                     ended = (tok == self._eos)
 
-                    # state is a DecoderState with tensors of shape [1, hidden]
-                    # IMPORTANT: clone to avoid accidental aliasing between hyps
+                    # clone state tensors to avoid aliasing between hypotheses
                     new_state = DecoderState(
                         h=step.state.h.clone(),
                         c=step.state.c.clone(),
@@ -140,26 +126,24 @@ class BeamSearchDecoder:
 
                     candidates.append(_Hyp(ids=new_ids, score=new_score, state=new_state, ended=ended))
 
-            # rank candidates by length-penalized score
+            # rank by length-penalized score
             candidates.sort(key=lambda h: h.score / self._len_penalty(len(h.ids)), reverse=True)
 
-            # next beam = best K candidates that are not finished
-            beam = []
+            # build next beam
+            next_beam: List[_Hyp] = []
             for h in candidates:
                 if h.ended:
                     finished.append(h)
                 else:
-                    beam.append(h)
-                if len(beam) >= self._beam:
+                    next_beam.append(h)
+                if len(next_beam) >= self._beam:
                     break
 
-            # if no alive hyps remain, stop
+            beam = next_beam
             if len(beam) == 0:
                 break
 
-        # choose best from finished if any, else from beam
         pool = finished if len(finished) > 0 else beam
         pool.sort(key=lambda h: h.score / self._len_penalty(len(h.ids)), reverse=True)
         best = pool[0]
-
         return torch.tensor(best.ids, dtype=torch.long, device=device)
