@@ -13,7 +13,6 @@ class LossComputer:
         return self._ce(flat_logits, flat_targets)
 
     def _targets(self, tgt_ids: torch.Tensor) -> torch.Tensor:
-        # targets = המילה הבאה: מהעמודה 1 ועד הסוף
         return tgt_ids[:, 1:]
 
     def _flatten(self, logits: torch.Tensor, targets: torch.Tensor):
